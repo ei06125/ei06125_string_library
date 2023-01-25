@@ -1,0 +1,167 @@
+name: CI with matrix strategy
+
+# specify what events trigger your workflow
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  Test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+
+      # =======================================================================
+      # matrix: run for all the combinations of OS, compiler and build_type
+      # =======================================================================
+      matrix:
+        os:
+          - macos-11
+          - ubuntu-20.04
+          - windows-2022
+        compiler:
+          - gcc
+          - llvm
+          - msvc
+        generator:
+          - "Ninja Multi-Config"
+        build_type:
+          - Release
+          - Debug
+
+        exclude:
+          - os: windows-2022
+            compiler: gcc
+            # no msvc on non-windows OS
+          - os: macos-11
+            compiler: msvc
+          - os: ubuntu-20.04
+            compiler: msvc
+          # -------------------------------------------------------------------
+          # because of the following problem: https://stackoverflow.com/questions/68878564/missing-typename-in-gcc-11-1-0-ranges-header
+          # we exclude ubuntu-latest with llvm from the matrix
+          # -------------------------------------------------------------------
+          - os: ubuntu-20.04
+            compiler: llvm
+
+        # include overrides default and exclude rules so it should come last
+        # include:
+        # # Add appropriate variables for gcov version required. This will intentionally break
+        # # if you try to use a compiler that does not have gcov set
+        # - compiler: gcc
+        #   gcov_executable: gcov
+        # - compiler: llvm
+        #   gcov_executable: "llvm-cov gcov"
+
+        # # Set up preferred package generators, for given build configurations
+        # - build_type: Release
+        #   package_generator: TBZ2
+
+        # - os: windows-2022
+        #   compiler: msvc
+        #   generator: "Visual Studio 17 2022"
+        #   build_type: Debug
+        # - os: windows-2022
+        #   compiler: msvc
+        #   generator: "Visual Studio 17 2022"
+        #   build_type: Release
+        #   package_generator: ZIP
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          submodules: "true"
+      
+      - name: Submodule init
+        run: git submodule init && git submodule update && cd tools/ && git submodule init && git submodule update
+
+      # :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+      # Caching dependencies to speed up workflows
+      # :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+      - name: Cache C++ packages
+        uses: actions/cache@v3
+        id: cache
+        with:
+          path: |
+            ~/.cache/cpp-build
+            ~/tools/vcpkg
+            ~/vcpkg
+            ./build/vcpkg_installed
+            ${{ env.HOME }}/.cache/vcpkg/archives
+            ${{ env.XDG_CACHE_HOME }}/vcpkg/archives
+            ${{ env.LOCALAPPDATA }}\vcpkg\archives
+            ${{ env.APPDATA }}\vcpkg\archives
+          key: ${{ runner.os }}-${{ matrix.compiler }}-${{ env.BUILD_TYPE }}-${{ hashFiles('**/CMakeLists.txt') }}-${{ hashFiles('./vcpkg.json')}}
+          restore-keys: |
+            ${{ runner.os }}-build-${{ env.cache-name }}-
+            ${{ runner.os }}-build-
+            ${{ runner.os }}-
+
+      - name: Test Cache
+        if: steps.cache.outputs.cache-hit == 'false'
+        run: echo "Cache miss !!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+
+      # :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+      # Install all the tools required for building and testing C++/C projects.
+      # :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+      - name: Install Dependencies
+        uses: aminya/setup-cpp@v1
+        with:
+          compiler: ${{ matrix.compiler }}
+
+          # -------------------------------------------------------------------
+          # setup-cpp can install all of these tools:
+          # -------------------------------------------------------------------
+          cmake: true
+          ninja: true
+          # llvm
+          # gcc
+          # msvc
+          vcvarsall: ${{ contains(matrix.os, 'windows' )}}
+          vcpkg: true
+          # meson
+          # conan
+          # make
+          # task
+          ccache: true
+          cppcheck: true
+          clangtidy: true
+          clangformat: true
+          # doxygen
+          gcovr: true
+          opencppcoverage: true
+          # kcov
+
+          # -------------------------------------------------------------------
+          # setup-cpp can also install these tools if needed for the above:
+          # -------------------------------------------------------------------
+          # python
+          # choco
+          # brew
+          # sevenzip
+          # graphviz # /* for doxygen */
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B ./build -G "${{matrix.generator}}" -DCMAKE_BUILD_TYPE:STRING=${{matrix.build_type}} -DCMAKE_CROSSCOMPILING=1 -DCMAKE_TOOLCHAIN_FILE:STRING=./tools/vcpkg/scripts/buildsystems/vcpkg.cmake -DRUN_HAVE_STD_REGEX=0 -DRUN_HAVE_POSIX_REGEX=0 -DBENCHMARK_ENABLE_TESTING:BOOL=FALSE -DBENCHMARK_ENABLE_GTEST_TESTS:BOOL=FALSE -DOPT_ENABLE_COVERAGE:BOOL=${{ matrix.build_type == 'Debug' }} -DGIT_SHA:STRING=${{ github.sha }}
+
+      - name: Build
+        run: |
+          cmake --build ./build --config ${{matrix.build_type}}
+
+      - name: Unix - Test and coverage
+        if: runner.os != 'Windows'
+        working-directory: ./build
+        run: |
+          ctest -C ${{matrix.build_type}}
+          # gcovr -j ${{env.nproc}} --delete --root ../ --print-summary --xml-pretty --xml coverage.xml . --gcov-executable '${{ matrix.gcov_executable }}'
+
+      - name: Windows - Test and coverage
+        if: runner.os == 'Windows'
+        working-directory: ./build
+        run: |
+          ctest -C ${{matrix.build_type}}
+          # OpenCppCoverage.exe --export_type cobertura:coverage.xml --cover_children -- ctest -C ${{matrix.build_type}}
